@@ -1,0 +1,6 @@
+# Copy thành .dev.vars để chạy local (KHÔNG commit file .dev.vars)
+BOT_TOKEN=123456:telegram-bot-token
+WEBHOOK_SECRET=chuoi_ngau_nhien_32_den_64_ky_tu
+GEMINI_API_KEY=your-gemini-api-key
+OWNER_CLAIM_CODE=ma_claim_ngau_nhien_toi_thieu_24_ky_tu
+ADMIN_KEY=mat_khau_admin_ngau_nhien_toi_thieu_24_ky_tu

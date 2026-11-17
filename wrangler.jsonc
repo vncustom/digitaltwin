@@ -1,0 +1,40 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "digitaltwin",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "digitaltwin-db",
+      "database_id": "939b5ea8-df1f-439c-9244-46a21fb60db6",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Hàng đợi xử lý file (PDF/Word/Excel/ảnh) — consumer có tới 15 phút, không bị giới hạn 30s như waitUntil
+  "queues": {
+    "producers": [{ "binding": "JOBS", "queue": "digitaltwin-jobs" }],
+    "consumers": [{ "queue": "digitaltwin-jobs", "max_batch_size": 1, "max_retries": 0 }]
+  },
+
+  // Tìm kiếm theo nghĩa: vector 768 chiều từ gemini-embedding-001
+  "vectorize": [{ "binding": "VEC", "index_name": "digitaltwin-vec" }],
+
+  // (Tùy chọn) Lưu file gốc vào R2: bật R2 trong Dashboard, tạo bucket rồi bỏ comment:
+  // "r2_buckets": [{ "binding": "FILES", "bucket_name": "digitaltwin-files" }],
+
+  "vars": {
+    "GEMINI_MODEL": "gemini-flash-lite-latest",
+    "TIMEZONE_OFFSET_HOURS": "7"
+  },
+
+  // Giờ UTC: 14:00 = 21:00 VN (báo cáo ngày), 01:00 = 08:00 VN (nhắc deadline)
+  "triggers": { "crons": ["0 14 * * *", "0 1 * * *"] }
+
+  // Secrets (đặt bằng `npx wrangler secret put <TÊN>`, local dùng file .dev.vars):
+  // BOT_TOKEN, WEBHOOK_SECRET, GEMINI_API_KEY, OWNER_CLAIM_CODE, ADMIN_KEY
+}
