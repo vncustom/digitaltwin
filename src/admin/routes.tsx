@@ -23,7 +23,7 @@ import { notifyEnabled, setNotify } from '../cron';
 import { markdownToTelegramHtml } from '../telegram/api';
 import { isoNow, localDate } from '../lib/util';
 import { raw } from 'hono/html';
-import { MODEL_CHOICES, getModel, switchModel } from '../brain/gemini';
+import { MODEL_CHOICES, getAiErrors, getModel, switchModel } from '../brain/gemini';
 
 type C = Context<AppEnv>;
 export const admin = new Hono<AppEnv>();
@@ -644,8 +644,9 @@ admin.get('/reports', async (c) => {
 
 // ================= Cài đặt =================
 admin.get('/settings', async (c) => {
-  const [model, rep, rem, vec] = await Promise.all([
+  const [model, aiErrors, rep, rem, vec] = await Promise.all([
     getModel(c.env),
+    getAiErrors(c.env),
     notifyEnabled(c.env, 'notify_report'),
     notifyEnabled(c.env, 'notify_remind'),
     c.env.DB.prepare("SELECT (SELECT count(*) FROM entries WHERE source <> 'core_import') e, (SELECT count(DISTINCT entry_id) FROM chunks) i").first<{ e: number; i: number }>(),
@@ -681,6 +682,24 @@ admin.get('/settings', async (c) => {
         ))}
         <div class="muted" style="font-size:13px">Model đã chọn lỗi hoặc quá tải thì bot tự dùng Flash-Lite cho câu đó. Trên Telegram: /model lite hoặc /model hydrogen.</div>
       </div>
+      <h2>Lỗi AI gần đây</h2>
+      {aiErrors.length ? (
+        <table class="resp">
+          <thead><tr><th>Lúc</th><th>Model</th><th>Mã</th><th>Chi tiết</th></tr></thead>
+          <tbody>
+            {aiErrors.slice(0, 10).map((e) => (
+              <tr>
+                <td class="num">{fmtTime(c.env, e.at)}</td>
+                <td>{e.model}</td>
+                <td class="num">{e.status ?? '—'}</td>
+                <td style="word-break:break-word;font-size:13px">{e.msg}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <div class="card empty">Chưa ghi nhận lỗi AI nào.</div>
+      )}
       <h2>Tìm kiếm theo nghĩa</h2>
       <div class="card row" style="justify-content:space-between">
         <div>

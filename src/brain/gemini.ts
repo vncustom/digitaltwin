@@ -21,6 +21,25 @@ export interface GenerateOptions {
   model?: string;
   /** Nếu phải chuyển sang Lite vì model đã chọn lỗi, thêm một dòng báo vào cuối câu trả lời. */
   fallbackNote?: boolean;
+  /**
+   * Bật Google Search grounding (model tự tra Google khi cần). Cần API key có hạn mức công cụ này;
+   * nếu Gemini từ chối (400/403/429) thì tự gọi lại KHÔNG có công cụ và báo qua onMeta.webRefused.
+   * Không dùng cùng jsonSchema.
+   */
+  webSearch?: boolean;
+  /**
+   * System prompt dùng khi Google Search bị từ chối và phải gọi lại không có công cụ — để model KHÔNG nói
+   * rằng mình đã tra web. Bắt buộc nên cung cấp khi webSearch = true.
+   */
+  systemNoWeb?: string;
+  /** Nhận thông tin nguồn web đã dùng / việc tra web có bị từ chối không. */
+  onMeta?: (m: GenerateMeta) => void;
+}
+
+export interface GenerateMeta {
+  sources: { title: string; uri: string }[];
+  queries: string[];
+  webRefused: boolean;
 }
 
 export class GeminiError extends Error {
@@ -105,21 +124,26 @@ async function callModel(env: Env, model: string, o: GenerateOptions): Promise<s
   const url = `${base}/v1beta/models/${model}:generateContent`;
   // Model "suy nghĩ" (không phải Lite) tính cả token suy nghĩ vào maxOutputTokens → nới trần để không bị cắt cụt/rỗng.
   const maxOut = (o.maxTokens ?? 1024) + (model === LITE_MODEL ? 0 : 8192);
-  const body = JSON.stringify({
-    systemInstruction: { parts: [{ text: o.system }] },
-    contents: o.turns.map((t, i) => ({
-      role: t.role,
-      parts: [
-        ...(i === o.turns.length - 1 && o.files ? o.files.map((f) => ({ file_data: { mime_type: f.mimeType, file_uri: f.uri } })) : []),
-        { text: t.text },
-      ],
-    })),
-    generationConfig: {
-      maxOutputTokens: maxOut,
-      temperature: o.temperature ?? 0.3,
-      ...(o.jsonSchema ? { responseMimeType: 'application/json', responseSchema: o.jsonSchema } : {}),
-    },
-  });
+  const buildBody = (web: boolean) =>
+    JSON.stringify({
+      systemInstruction: { parts: [{ text: !web && o.webSearch && o.systemNoWeb ? o.systemNoWeb : o.system }] },
+      contents: o.turns.map((t, i) => ({
+        role: t.role,
+        parts: [
+          ...(i === o.turns.length - 1 && o.files ? o.files.map((f) => ({ file_data: { mime_type: f.mimeType, file_uri: f.uri } })) : []),
+          { text: t.text },
+        ],
+      })),
+      ...(web ? { tools: [{ google_search: {} }] } : {}),
+      generationConfig: {
+        maxOutputTokens: maxOut,
+        temperature: o.temperature ?? 0.3,
+        ...(o.jsonSchema ? { responseMimeType: 'application/json', responseSchema: o.jsonSchema } : {}),
+      },
+    });
+  let useWeb = !!o.webSearch && !o.jsonSchema;
+  let webRefused = false;
+  let body = buildBody(useWeb);
 
   let lastErr: GeminiError | undefined;
   const attempts = model === LITE_MODEL ? 3 : 2;
@@ -141,7 +165,11 @@ async function callModel(env: Env, model: string, o: GenerateOptions): Promise<s
     }
     if (res.ok) {
       const data = (await res.json()) as {
-        candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] }; finishReason?: string }[];
+        candidates?: {
+          content?: { parts?: { text?: string; thought?: boolean }[] };
+          finishReason?: string;
+          groundingMetadata?: { webSearchQueries?: string[]; groundingChunks?: { web?: { uri?: string; title?: string } }[] };
+        }[];
       };
       const parts = data.candidates?.[0]?.content?.parts ?? [];
       const text = parts
@@ -150,14 +178,73 @@ async function callModel(env: Env, model: string, o: GenerateOptions): Promise<s
         .join('')
         .trim();
       if (!text) throw new GeminiError(`Gemini trả rỗng (${data.candidates?.[0]?.finishReason ?? 'unknown'})`);
+      if (o.onMeta) {
+        const gm = data.candidates?.[0]?.groundingMetadata;
+        const seen = new Set<string>();
+        const sources: GenerateMeta['sources'] = [];
+        for (const ch of gm?.groundingChunks ?? []) {
+          const uri = ch.web?.uri;
+          if (!uri || seen.has(uri)) continue;
+          seen.add(uri);
+          sources.push({ title: ch.web?.title || uri, uri });
+        }
+        o.onMeta({ sources, queries: gm?.webSearchQueries ?? [], webRefused });
+      }
       return text;
     }
     // Không log nội dung/khóa; chỉ mã lỗi và đoạn ngắn.
     const detail = (await res.text()).slice(0, 160).replace(/\s+/g, ' ');
     lastErr = new GeminiError(`Gemini HTTP ${res.status}: ${detail}`, res.status);
+    // Công cụ Google Search bị từ chối (gói miễn phí chưa có hạn mức, tool không hỗ trợ…): gọi lại ngay KHÔNG có công cụ.
+    if (useWeb && (res.status === 400 || res.status === 403 || res.status === 429)) {
+      console.warn('google_search refused', res.status);
+      useWeb = false;
+      webRefused = true;
+      body = buildBody(false);
+      attempt--;
+      continue;
+    }
     if (res.status !== 429 && res.status < 500) break; // lỗi phía mình: không retry
   }
   throw lastErr ?? new GeminiError('Gemini lỗi không rõ');
+}
+
+// ================= Nhật ký lỗi AI (để biết lỗi THẬT là gì) =================
+export interface AiErrorRecord {
+  at: string;
+  model: string;
+  status: number | null;
+  msg: string;
+}
+
+async function recordAiError(env: Env, model: string, err: unknown) {
+  try {
+    const status = err instanceof GeminiError ? (err.status ?? null) : null;
+    let where = '';
+    // 400/403 thường là "User location is not supported" hoặc key bị từ chối: ghi thêm trạm Cloudflare đang chạy Worker
+    if (status === 400 || status === 403) {
+      try {
+        const t = await (await fetch('https://www.cloudflare.com/cdn-cgi/trace', { signal: AbortSignal.timeout(3000) })).text();
+        where = ` [colo=${/colo=(\w+)/.exec(t)?.[1] ?? '?'} loc=${/loc=(\w+)/.exec(t)?.[1] ?? '?'}]`;
+      } catch {
+        /* bỏ qua */
+      }
+    }
+    const list = await getAiErrors(env);
+    list.unshift({ at: new Date().toISOString(), model, status, msg: (String(err).replace(/\s+/g, ' ').slice(0, 300)) + where });
+    await setSetting(env, 'ai_errors', JSON.stringify(list.slice(0, 15)));
+  } catch {
+    /* không để việc ghi log làm hỏng luồng chính */
+  }
+}
+
+export async function getAiErrors(env: Env): Promise<AiErrorRecord[]> {
+  try {
+    const v = await getSetting(env, 'ai_errors');
+    return v ? (JSON.parse(v) as AiErrorRecord[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 // Khi model đã chọn vừa lỗi, các lần gọi kế tiếp (trong 2 phút) đi thẳng Flash-Lite thay vì chờ thêm một lượt timeout nữa.
@@ -166,25 +253,32 @@ const PRIMARY_COOLDOWN_MS = 120_000;
 
 export async function generate(env: Env, o: GenerateOptions): Promise<string> {
   if (!env.GEMINI_API_KEY) throw new GeminiError('Thiếu GEMINI_API_KEY');
+  const run = async (model: string) => {
+    try {
+      return await callModel(env, model, o);
+    } catch (err) {
+      await recordAiError(env, model, err);
+      throw err;
+    }
+  };
   const primary = o.model ?? (await getModel(env));
-  if (o.model || primary === LITE_MODEL) return callModel(env, primary, o);
+  if (o.model || primary === LITE_MODEL) return run(primary);
 
   const note = (text: string) =>
     o.fallbackNote
       ? `${text}\n\n*(⚠️ ${MODEL_CHOICES[primary]?.label ?? primary} đang quá tải/không phản hồi nên câu này do ${MODEL_CHOICES[LITE_MODEL].label} trả lời.)*`
       : text;
 
-  if (Date.now() < primaryDownUntil) return note(await callModel(env, LITE_MODEL, o));
+  if (Date.now() < primaryDownUntil) return note(await run(LITE_MODEL));
   try {
-    return await callModel(env, primary, o);
+    return await run(primary);
   } catch (err) {
     // Model đã chọn lỗi/quá tải/chậm/hết hạn mức → làm tiếp bằng Flash-Lite thay vì để người dùng không có câu trả lời.
     primaryDownUntil = Date.now() + PRIMARY_COOLDOWN_MS;
     console.warn('model fallback', primary, '->', LITE_MODEL, String(err).slice(0, 120));
-    return note(await callModel(env, LITE_MODEL, o));
+    return note(await run(LITE_MODEL));
   }
 }
-
 /** Gọi Gemini ở chế độ JSON và parse kết quả; trả null nếu không parse được. */
 export async function generateJson<T>(env: Env, o: GenerateOptions & { jsonSchema: Record<string, unknown> }): Promise<T | null> {
   const raw = await generate(env, { temperature: 0.1, ...o });
@@ -204,8 +298,14 @@ export async function generateJson<T>(env: Env, o: GenerateOptions & { jsonSchem
 
 export function friendlyAiError(err: unknown): string {
   const status = err instanceof GeminiError ? err.status : undefined;
-  if (status === 429) return '⏳ Gemini đang hết hạn mức (429). Thử lại sau ít phút.';
-  if (status === 404) return '⚠️ Model Gemini không khả dụng cho API key này (404).';
-  if (status === 400 || status === 403) return '⚠️ Gemini từ chối yêu cầu (kiểm tra GEMINI_API_KEY).';
-  return '⚠️ AI tạm thời không khả dụng. Dữ liệu của bạn vẫn được lưu.';
+  // Lấy câu mô tả ngắn từ phản hồi của Gemini (không chứa khóa/nội dung người dùng)
+  const raw = String(err instanceof Error ? err.message : err);
+  const apiMsg = /"message":\s*"([^"]{1,140})/.exec(raw)?.[1] ?? '';
+  const detail = apiMsg ? `\n(Gemini báo: ${apiMsg})` : '';
+  if (status === 429) return '⏳ Gemini đang hết hạn mức (429). Thử lại sau ít phút.' + detail;
+  if (status === 404) return '⚠️ Model Gemini không khả dụng cho API key này (404).' + detail;
+  if (status === 400 || status === 403) return `⚠️ Gemini từ chối yêu cầu (HTTP ${status}).${detail}\nChi tiết: trang quản trị → Cài đặt → Lỗi AI gần đây.`;
+  if (err instanceof GeminiError && err.timeout) return '⏳ Gemini không phản hồi kịp (quá thời gian chờ).';
+  if (status && status >= 500) return `⚠️ Gemini đang quá tải/lỗi máy chủ (HTTP ${status}).` + detail;
+  return '⚠️ AI tạm thời không khả dụng.' + (raw ? `\n(${raw.replace(/^(Gemini)?Error:\s*/, '').slice(0, 120)})` : '');
 }

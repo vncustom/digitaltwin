@@ -23,3 +23,9 @@ export async function setSettingIfAbsent(env: Env, key: string, value: string): 
 }
 
 export const getOwnerChatId = (env: Env) => getSetting(env, 'owner_chat_id');
+
+/** Chế độ tra Google: 'auto' (mặc định: chỉ khi câu hỏi cần thông tin bên ngoài) hoặc 'off'. */
+export type WebMode = 'auto' | 'off';
+export async function getWebMode(env: Env): Promise<WebMode> {
+  return (await getSetting(env, 'web_mode')) === 'off' ? 'off' : 'auto';
+}

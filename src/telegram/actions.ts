@@ -34,23 +34,33 @@ export async function applyExtraction(env: Env, chatId: number, entryId: number,
   }
 }
 
+/** Bỏ các dòng chú thích do bot gắn thêm: "*(ℹ️ …)*", "*(⚠️ …)*" và khối "🌐 Nguồn web …". */
+export function stripBotNotes(s: string): string {
+  return s
+    .replace(/\n*\*\((?:ℹ️|⚠️)[\s\S]*?\)\*/g, '')
+    .replace(/\n*🌐 Nguồn web[\s\S]*$/, '')
+    .trim();
+}
+
 export async function doAnswer(
   env: Env,
   chatId: number,
   question: string,
-  o: { searchQuery?: string; remember?: boolean } = {},
+  o: { searchQuery?: string; remember?: boolean; web?: boolean } = {},
 ) {
   await sendTyping(env, chatId);
   let reply: string;
   try {
-    reply = await answer(env, question, { searchQuery: o.searchQuery });
+    reply = await answer(env, question, { searchQuery: o.searchQuery, web: o.web });
   } catch (err) {
     console.error('answer failed', String(err));
     return void (await sendMessage(env, chatId, friendlyAiError(err)));
   }
   if (o.remember !== false) {
     await insertMessage(env, 'user', question);
-    await insertMessage(env, 'assistant', reply);
+    // Lưu vào lịch sử BẢN KHÔNG có các dòng chú thích của bot (cảnh báo Google/model, danh sách nguồn web),
+    // nếu không model sẽ bắt chước và lặp lại chúng ở các câu trả lời sau.
+    await insertMessage(env, 'assistant', stripBotNotes(reply));
   }
   await sendRich(env, chatId, reply);
 }

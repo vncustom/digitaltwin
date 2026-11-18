@@ -8,6 +8,7 @@ import { uploadToGemini, deleteGeminiFile } from '../brain/gemini-files';
 import { generate, friendlyAiError } from '../brain/gemini';
 import { understand } from '../brain/understand';
 import { isoNow } from '../lib/util';
+import { looksLikeQuestion } from '../lib/intent';
 import { indexEntrySafe } from '../memory/vectors';
 
 export const MAX_FILE_BYTES = 20 * 1024 * 1024; // giới hạn tải file của Telegram Bot API
@@ -112,6 +113,21 @@ async function extractText(env: Env, job: FileJob, kind: FileKind): Promise<{ te
   }
 }
 
+/**
+ * Phân tích lời nhắn (caption) kèm file.
+ *  - "/note …": chỉ ghi nhận (lưu cùng file), không trả lời.
+ *  - "/ask …": coi là câu hỏi về file.
+ *  - còn lại: là câu hỏi/yêu cầu nếu có dấu "?" hoặc mở đầu bằng động từ yêu cầu ("tóm tắt…", "liệt kê…", "cho biết…"); ngược lại chỉ là ghi chú.
+ */
+export function analyzeCaption(raw: string): { text: string; ask: boolean } {
+  const c = (raw ?? '').trim();
+  const note = /^\/note(?:@\w+)?\s*([\s\S]*)$/i.exec(c);
+  if (note) return { text: note[1].trim(), ask: false };
+  const ask = /^\/ask(?:@\w+)?\s*([\s\S]*)$/i.exec(c);
+  if (ask) return { text: ask[1].trim(), ask: true };
+  return { text: c, ask: looksLikeQuestion(c) };
+}
+
 /** Xử lý một file người dùng gửi: đọc → lưu → trích xuất → báo kết quả (và trả lời caption nếu có). */
 export async function processFileJob(env: Env, job: FileJob) {
   const kind = detectKind(job.fileName, job.mime);
@@ -131,7 +147,7 @@ export async function processFileJob(env: Env, job: FileJob) {
   if (content.length < 5) return void (await sendMessage(env, job.chatId, `⚠️ Không tìm thấy nội dung chữ trong "${job.fileName}".`));
 
   // Lưu cả lời nhắn kèm theo (vd bảng ký hiệu ca "Fs = F sáng…", "Hàn là tôi") để về sau còn hiểu được file
-  const caption = job.caption.trim();
+  const { text: caption, ask } = analyzeCaption(job.caption);
   const stored = caption.length > 3 ? `[Lời nhắn của chủ sở hữu khi gửi file: ${caption}]\n\n${content}` : content;
   const entryId = await insertEntry(env, { kind: 'document', content: stored, title: job.fileName });
   await env.DB.prepare('UPDATE entries SET file_name = ?, mime_type = ? WHERE id = ?').bind(job.fileName, job.mime, entryId).run();
@@ -141,7 +157,7 @@ export async function processFileJob(env: Env, job: FileJob) {
   try {
     u = await understand(
       env,
-      `[File: ${job.fileName}]${job.caption ? `\n[Lời nhắn kèm: ${job.caption}]` : ''}\n\n${content}`,
+      `[File: ${job.fileName}]${caption ? `\n[Lời nhắn kèm: ${caption}]` : ''}\n\n${content}`,
       'note',
       { document: true, extract: kind !== 'xlsx' && kind !== 'csv' }, // bảng tính: chỉ tóm tắt, không sinh hàng loạt việc
     );
@@ -154,7 +170,7 @@ export async function processFileJob(env: Env, job: FileJob) {
   const isMeeting = /biên bản|cuộc họp|họp giao ban|meeting/i.test(`${u.title} ${u.summary ?? ''}`);
   await updateEntryMeta(env, entryId, { kind: isMeeting ? 'meeting' : 'document', title: u.title, summary: u.summary, processed: 1 });
   await indexEntrySafe(env, entryId); // trước khi trả lời caption để câu trả lời tìm được đoạn khớp
-  await insertMessage(env, 'user', `[Đã gửi file "${job.fileName}" → #${entryId}: ${u.title}]${job.caption ? ' ' + job.caption : ''}`);
+  await insertMessage(env, 'user', `[Đã gửi file "${job.fileName}" → #${entryId}: ${u.title}]${caption ? ' ' + caption : ''}`);
 
   const secs = Math.round((Date.now() - t0) / 1000);
   await applyExtraction(env, job.chatId, entryId, u, [
@@ -162,11 +178,13 @@ export async function processFileJob(env: Env, job: FileJob) {
     `${u.title}`,
     ...(extracted.note ? [`ℹ️ ${extracted.note}`] : []),
     ...(u.summary ? ['', u.summary] : []),
+    ...(isMeeting ? ['', `💡 Đã ghi nhận biên bản #${entryId}. Tra lại sau: nhắn câu hỏi (vd "Biên bản #${entryId} giao việc gì cho anh Khoa?") hoặc /search <từ khóa>.`] : []),
   ]);
 
-  // Có lời nhắn kèm (vd "tóm tắt giúp anh các điểm rủi ro") → trả lời dựa trên file vừa đọc
-  if (job.caption && job.caption.length > 3) {
-    await doAnswer(env, job.chatId, `${job.caption}\n(Về file "${job.fileName}" vừa gửi, ghi chú #${entryId})`, {
+  // Lời nhắn là CÂU HỎI/yêu cầu (vd "tóm tắt các điểm rủi ro") → trả lời dựa trên file vừa đọc.
+  // Lời nhắn chỉ là ghi chú/nhãn (vd "/note Biên bản họp giao ban 17/11") → chỉ ghi nhận, không trả lời thừa.
+  if (ask && caption.length > 3) {
+    await doAnswer(env, job.chatId, `${caption}\n(Về file "${job.fileName}" vừa gửi, ghi chú #${entryId})`, {
       searchQuery: `${u.search_query} ${job.fileName}`,
     });
   }

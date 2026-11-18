@@ -1,5 +1,5 @@
 import type { Env, FileJob, ReindexJob } from '../env';
-import { getOwnerChatId, setSettingIfAbsent } from '../db/settings';
+import { getOwnerChatId, getWebMode, setSetting, setSettingIfAbsent } from '../db/settings';
 import { deleteEntry, insertEntry, insertMessage, updateEntryMeta } from '../db/entries';
 import { addDays, isoNow, localDate, safeEqual } from '../lib/util';
 import { notifyEnabled, sendDailyReport, setNotify } from '../cron';
@@ -12,6 +12,8 @@ import { understand, type Intent } from '../brain/understand';
 import { MODEL_CHOICES, friendlyAiError, getModel, parseModelArg, switchModel } from '../brain/gemini';
 import { createTasks, formatDue, formatTask, listOpenTasks, setTaskStatus } from '../memory/tasks';
 import { hybridSearch } from '../memory/search';
+import { answerDutyQuestion, dutyWeek, getAliases, setAliases } from '../memory/duty';
+import { looksLikeQuestion } from '../lib/intent';
 import { deleteEntryVectors, indexEntrySafe } from '../memory/vectors';
 import { processReindexJob } from '../files/reindex';
 import { MAX_FILE_BYTES, UNSUPPORTED_HINT, detectKind, processFileJob } from '../files/process';
@@ -38,6 +40,8 @@ Lệnh:
 /remind – xem nhắc việc ngay
 /notify – bật/tắt báo cáo 21:00 và nhắc việc 8:00
 /model lite|hydrogen – đổi model AI (gõ /model để xem)
+/web <câu hỏi> – ép tra Google (tin tức, lỗi thiết bị…)  •  /web off|auto
+/duty – lịch trực của tôi hôm nay, ngày mai, 7 ngày tới
 /help – hướng dẫn`;
 
 /** Điểm vào cho mỗi update; mọi lỗi được bắt ở đây để webhook luôn trả 200. */
@@ -116,6 +120,33 @@ async function handleMessage(env: Env, msg: TgMessage) {
       ));
     case '/model':
       return void (await handleModelCommand(env, chatId, arg));
+    case '/duty': {
+      const a = arg.match(/^alias(?:\s+(.+))?$/i);
+      if (a) {
+        if (a[1]) {
+          const list = a[1].split(',').map((x) => x.trim()).filter(Boolean).slice(0, 5);
+          await setAliases(env, list);
+          return void (await sendMessage(env, chatId, `✅ Tên anh trong bảng lịch trực: ${list.join(', ')}`));
+        }
+        const cur = await getAliases(env);
+        return void (await sendMessage(env, chatId, cur.aliases.length ? `Tên anh trong bảng lịch trực: ${cur.aliases.join(', ')} (${cur.from === 'setting' ? 'đã cài' : 'tự suy ra từ trí nhớ cốt lõi'}).\nĐổi: /duty alias Hàn` : 'Chưa biết tên anh trong bảng lịch. Gõ: /duty alias Hàn'));
+      }
+      const w = await dutyWeek(env, localDate(env), 7);
+      if (!w.aliases.length) return void (await sendMessage(env, chatId, 'Chưa biết tên anh trong bảng lịch trực. Gõ: /duty alias Hàn (tên ghi trong bảng, nhiều tên cách nhau dấu phẩy).'));
+      return void (await sendMessage(env, chatId, `👷 LỊCH TRỰC 7 NGÀY TỚI (tên trong lịch: ${w.aliases.join(', ')})\n\n${w.lines.join('\n')}${w.found ? '' : '\n\nChưa có bảng lịch nào chứa các ngày này. Hãy gửi file lịch trực (Excel).'}`));
+    }
+    case '/web': {
+      const a = arg.trim().toLowerCase();
+      if (a === 'off' || a === 'auto') {
+        await setSetting(env, 'web_mode', a);
+        return void (await sendMessage(env, chatId, a === 'off' ? '🌐 Đã TẮT tự tra Google. Vẫn tra được khi anh gõ /web <câu hỏi>.' : '🌐 Đã BẬT chế độ tự động: bot chỉ tra Google khi câu hỏi cần thông tin bên ngoài hoặc mới.'));
+      }
+      if (!arg) {
+        const mode = await getWebMode(env);
+        return void (await sendMessage(env, chatId, `🌐 TRA GOOGLE (Google Search grounding)\nChế độ: ${mode === 'auto' ? 'TỰ ĐỘNG' : 'TẮT'}\n\n/web <câu hỏi> — ép tra Google cho câu này\n/web auto — tự tra khi cần (mặc định)\n/web off — không tự tra\n\nVí dụ: /web phiên bản firmware mới nhất của ATEM Mini Pro có lỗi gì đáng chú ý?`));
+      }
+      return void (await doAnswer(env, chatId, arg.slice(0, MAX_TEXT), { web: true }));
+    }
     case '/report': {
       const day = arg.match(/^\d{4}-\d{2}-\d{2}$/) ? arg : /^(hom qua|hôm qua|yesterday)$/i.test(arg) ? addDays(localDate(env), -1) : localDate(env);
       await sendTyping(env, chatId);
@@ -208,23 +239,36 @@ async function handleText(env: Env, chatId: number, input: string, force?: Inten
   const text = input.slice(0, MAX_TEXT);
   await sendTyping(env, chatId);
 
+  // Câu hỏi về LỊCH TRỰC của chính chủ sở hữu: trả lời thẳng từ bảng lịch, không cần AI (nhanh, chạy cả khi Gemini lỗi)
+  if (force !== 'note') {
+    const duty = await answerDutyQuestion(env, text, localDate(env)).catch((e) => (console.error('duty answer failed', String(e)), null));
+    if (duty) {
+      await insertMessage(env, 'user', text);
+      await insertMessage(env, 'assistant', duty);
+      return void (await sendMessage(env, chatId, duty));
+    }
+  }
+
   let u;
   try {
     u = await understand(env, text, force);
   } catch (err) {
-    // AI lỗi: nếu không chắc là câu hỏi thì vẫn lưu nguyên văn để không mất dữ liệu.
     console.error('understand failed', String(err));
-    if (force !== 'question') {
-      const id = await insertEntry(env, { kind: 'note', content: text });
-      await insertMessage(env, 'user', text);
-      await sendMessage(env, chatId, `📝 Đã lưu nguyên văn ghi chú #${id}.\n${friendlyAiError(err)}`);
-      await indexEntrySafe(env, id);
-    } else await sendMessage(env, chatId, friendlyAiError(err));
+    // AI không phân loại được. Câu hỏi thì KHÔNG được lưu thành ghi chú (làm bẩn trí nhớ): chỉ báo lỗi.
+    // Còn lại vẫn lưu nguyên văn để không mất dữ liệu.
+    if (force === 'question' || (force !== 'note' && looksLikeQuestion(text))) {
+      return void (await sendMessage(env, chatId, `${friendlyAiError(err)}\nĐây có vẻ là câu hỏi nên tôi không lưu thành ghi chú. Thử lại sau ít phút; nếu muốn lưu, gõ /note <nội dung>.`));
+    }
+    const id = await insertEntry(env, { kind: 'note', content: text });
+    await insertMessage(env, 'user', text);
+    await sendMessage(env, chatId, `📝 Đã lưu nguyên văn ghi chú #${id}.\n${friendlyAiError(err)}`);
+    await indexEntrySafe(env, id);
     return;
   }
 
   if (u.intent === 'question') {
-    return doAnswer(env, chatId, text, { searchQuery: u.search_query });
+    const web = u.needs_web && (await getWebMode(env)) !== 'off';
+    return doAnswer(env, chatId, text, { searchQuery: u.search_query, web });
   }
 
   if (u.intent === 'report_request') {
